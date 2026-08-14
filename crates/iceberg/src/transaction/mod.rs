@@ -70,7 +70,7 @@ use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWi
 pub use update_schema::AddColumn;
 
 use crate::error::Result;
-use crate::spec::TableProperties;
+use crate::spec::{DataFile, TableProperties};
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
@@ -149,6 +149,66 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Stage a **fast-append** of `data_files` to `table` and return the
+    /// `(updates, requirements)` it produces, **without** advancing any catalog
+    /// pointer.
+    ///
+    /// This runs the identical [`FastAppendAction`] path that
+    /// `tx.fast_append().add_data_files(..).apply(..).commit(catalog)` runs: the
+    /// same manifest and manifest-list files are written to `table`'s storage
+    /// and the same `AddSnapshot` / `SetSnapshotRef` [`TableUpdate`]s plus
+    /// `UuidMatch` / `RefSnapshotIdMatch` [`TableRequirement`]s are returned, so
+    /// the resulting snapshot is byte-identical to a standalone fast-append.
+    /// Only the catalog step is left to the caller.
+    ///
+    /// It exists so a caller that owns its own commit path can fold several
+    /// tables' fast appends into ONE atomic catalog commit instead of one
+    /// catalog round-trip per table. `FastAppendAction::commit` is
+    /// `pub(crate)`; this is its public projection to
+    /// `(updates, requirements)`.
+    pub async fn stage_fast_append(
+        table: &Table,
+        data_files: Vec<DataFile>,
+    ) -> Result<(Vec<TableUpdate>, Vec<TableRequirement>)> {
+        Self::stage_fast_append_with(table, data_files, true).await
+    }
+
+    /// [`stage_fast_append`](Self::stage_fast_append) with explicit control over
+    /// the duplicate-file precheck.
+    ///
+    /// `check_duplicate` maps straight onto
+    /// [`FastAppendAction::with_check_duplicate`]. Passing `true` is exactly
+    /// `stage_fast_append`; passing `false` skips
+    /// `SnapshotProducer::validate_duplicate_files`, whose cost is
+    /// **O(live data files in the table)** Avro manifest decodes *per commit* —
+    /// it loads the current manifest list and then `load_manifest()`s every
+    /// entry in it. That is the dominant term of commit latency on an aged
+    /// table, and it is pure overhead for a caller that derives every data-file
+    /// name from a per-call unique prefix, where a collision with an
+    /// already-referenced path is unreachable by construction.
+    ///
+    /// The staged bytes are identical either way: the check is a read-only
+    /// precondition that either passes or aborts the commit. It never alters
+    /// the manifest, the manifest list, or the returned updates. Skipping it
+    /// therefore changes ONLY whether an already-referenced path is rejected, so
+    /// a caller that cannot guarantee unique names must keep it on, and callers
+    /// appending caller-supplied file names always should.
+    pub async fn stage_fast_append_with(
+        table: &Table,
+        data_files: Vec<DataFile>,
+        check_duplicate: bool,
+    ) -> Result<(Vec<TableUpdate>, Vec<TableRequirement>)> {
+        let action = Arc::new(
+            FastAppendAction::new()
+                .with_check_duplicate(check_duplicate)
+                .add_data_files(data_files),
+        );
+        let mut commit = action.commit(table).await?;
+        let updates = commit.take_updates();
+        let requirements = commit.take_requirements();
+        Ok((updates, requirements))
     }
 
     /// Creates replace sort order action.
