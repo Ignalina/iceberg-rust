@@ -164,6 +164,7 @@ mod tests {
     use crate::encryption::kms::MemoryKeyManagementClient;
     use crate::encryption::{SensitiveBytes, StandardKeyMetadata};
     use crate::io::FileIO;
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestEntry, ManifestListWriter, ManifestStatus, ManifestWriterBuilder, SnapshotRef,
@@ -171,9 +172,9 @@ mod tests {
     };
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
-    use crate::transaction::tests::make_v2_minimal_table;
+    use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table_in_catalog};
     use crate::transaction::{Transaction, TransactionAction};
-    use crate::{TableIdent, TableRequirement, TableUpdate};
+    use crate::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
     fn render_template(template: &str, ctx: Value) -> String {
         let mut env = Environment::new();
@@ -920,5 +921,181 @@ mod tests {
             manifest.entries()[0].snapshot_id().unwrap()
         );
         assert_eq!(data_file, *manifest.entries()[0].data_file());
+    }
+
+    /// `Transaction::stage_fast_append` must produce exactly what a committed
+    /// fast-append action produces: the same update/requirement shape, and a real
+    /// manifest on storage carrying the staged file.
+    #[tokio::test]
+    async fn test_stage_fast_append_matches_committed_fast_append() {
+        let table = make_v2_minimal_table();
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/3.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let (updates, requirements) =
+            Transaction::stage_fast_append(&table, vec![data_file.clone()])
+                .await
+                .unwrap();
+
+        assert!(
+            matches!((&updates[0],&updates[1]), (TableUpdate::AddSnapshot { snapshot },TableUpdate::SetSnapshotRef { reference,ref_name }) if snapshot.snapshot_id() == reference.snapshot_id && ref_name == MAIN_BRANCH)
+        );
+        assert_eq!(
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid()
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: table.metadata().current_snapshot_id
+                }
+            ],
+            requirements
+        );
+
+        assert_eq!(
+            vec![data_file],
+            committed_data_files(&table, &updates).await
+        );
+    }
+
+    /// Staging must not advance any catalog pointer; the staged parts must then be
+    /// committable through the caller's own catalog round-trip.
+    #[tokio::test]
+    async fn test_stage_fast_append_leaves_commit_to_the_caller() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .build()
+            .unwrap();
+
+        let (updates, requirements) =
+            Transaction::stage_fast_append(&table, vec![data_file.clone()])
+                .await
+                .unwrap();
+
+        // Nothing committed yet: the catalog still serves the pre-stage metadata.
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(table.metadata(), reloaded.metadata());
+        assert!(reloaded.metadata().current_snapshot().is_none());
+
+        // The caller's own commit path: one TableCommit built from the staged parts.
+        let commit = TableCommit::builder()
+            .ident(table.identifier().to_owned())
+            .updates(updates)
+            .requirements(requirements)
+            .build();
+        let committed = catalog.update_table(commit).await.unwrap();
+
+        let snapshot = committed.metadata().current_snapshot().unwrap();
+        let manifest_list = committed
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(1, manifest_list.entries().len());
+        let manifest = manifest_list.entries()[0]
+            .load_manifest(committed.file_io())
+            .await
+            .unwrap();
+        assert_eq!(1, manifest.entries().len());
+        assert_eq!(
+            data_file.file_path(),
+            manifest.entries()[0].data_file().file_path()
+        );
+    }
+
+    /// The cross-snapshot duplicate-path check: staging a path the table already
+    /// references is rejected by `stage_fast_append` (check on) and accepted by
+    /// `stage_fast_append_with(.., false)`, which stages a snapshot carrying the two
+    /// existing manifests plus the new one.
+    #[tokio::test]
+    async fn test_stage_fast_append_duplicate_path_check() {
+        let (table, _tmp_dir, _delete_manifest_path) = make_table_with_delete_only_manifest().await;
+        let table_location = table.metadata().location().to_string();
+
+        let make_dup = || {
+            DataFileBuilder::default()
+                .partition_spec_id(0)
+                .content(DataContentType::Data)
+                .file_path(format!("{table_location}/data.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition(Struct::from_iter([Some(Literal::long(100))]))
+                .build()
+                .unwrap()
+        };
+
+        let err = Transaction::stage_fast_append(&table, vec![make_dup()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already referenced"), "{err}");
+
+        let (updates, _requirements) =
+            Transaction::stage_fast_append_with(&table, vec![make_dup()], false)
+                .await
+                .unwrap();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!("first update is always AddSnapshot")
+        };
+        let manifest_list = table
+            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(3, manifest_list.entries().len());
+    }
+
+    /// The duplicate check is a read-only precondition: requirements and staged
+    /// manifest content are identical whether it runs or not.
+    #[tokio::test]
+    async fn test_stage_fast_append_check_flag_stages_identical_content() {
+        let table = make_v2_minimal_table();
+
+        let make_file = || {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("test/3.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(300))]))
+                .build()
+                .unwrap()
+        };
+
+        let (updates_on, reqs_on) =
+            Transaction::stage_fast_append_with(&table, vec![make_file()], true)
+                .await
+                .unwrap();
+        let (updates_off, reqs_off) =
+            Transaction::stage_fast_append_with(&table, vec![make_file()], false)
+                .await
+                .unwrap();
+
+        assert_eq!(reqs_on, reqs_off);
+        let files_on = committed_data_files(&table, &updates_on).await;
+        let files_off = committed_data_files(&table, &updates_off).await;
+        assert_eq!(files_on, files_off);
+        assert_eq!(vec![make_file()], files_off);
     }
 }
